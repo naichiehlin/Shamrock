@@ -835,6 +835,10 @@ void shammodels::basegodunov::Solver<Tvec, TgridVec>::init_solver_graph() {
                 std::move(find_ghost_layer_indices)));
     }
 
+    // Nodes evaluated again after the update of the step, before the refinement: ghost zone
+    // exchange and the field references with ghosts (storage.gz_refresh_sequence, see evolve_once)
+    std::vector<std::shared_ptr<shamrock::solvergraph::INode>> gz_refresh_nodes;
+
     { // Ghost zone exchange
         std::vector<std::shared_ptr<shamrock::solvergraph::INode>> gz_xchg_sequence;
 
@@ -900,9 +904,10 @@ void shammodels::basegodunov::Solver<Tvec, TgridVec>::init_solver_graph() {
         //    gz_xchg_sequence.push_back(std::move(patch_data_layer_to_vtk_node));
         //}
 
-        shamrock::solvergraph::OperationSequence seq(
+        auto seq = std::make_shared<shamrock::solvergraph::OperationSequence>(
             "Ghost zone exchange", std::move(gz_xchg_sequence));
-        solver_sequence.push_back(std::make_shared<decltype(seq)>(std::move(seq)));
+        solver_sequence.push_back(seq);
+        gz_refresh_nodes.push_back(seq);
     }
 
     { // attach fields with ghosts
@@ -920,43 +925,52 @@ void shammodels::basegodunov::Solver<Tvec, TgridVec>::init_solver_graph() {
                 = shamrock::solvergraph::ExtractCounts();
             extract_counts_node.set_edges(
                 storage.merged_patchdata_ghost, storage.block_counts_with_ghost);
-            solver_sequence.push_back(
-                std::make_shared<decltype(extract_counts_node)>(std::move(extract_counts_node)));
+            auto node_ptr
+                = std::make_shared<decltype(extract_counts_node)>(std::move(extract_counts_node));
+            solver_sequence.push_back(node_ptr);
+            gz_refresh_nodes.push_back(node_ptr);
         }
 
         { // Attach spans to block coords
             shamrock::solvergraph::GetFieldRefFromLayer<TgridVec> attach_block_min
                 = shamrock::solvergraph::GetFieldRefFromLayer<TgridVec>(0);
             attach_block_min.set_edges(storage.merged_patchdata_ghost, storage.refs_block_min);
-            solver_sequence.push_back(
-                std::make_shared<decltype(attach_block_min)>(std::move(attach_block_min)));
+            auto attach_block_min_ptr
+                = std::make_shared<decltype(attach_block_min)>(std::move(attach_block_min));
+            solver_sequence.push_back(attach_block_min_ptr);
+            gz_refresh_nodes.push_back(attach_block_min_ptr);
 
             shamrock::solvergraph::GetFieldRefFromLayer<TgridVec> attach_block_max
                 = shamrock::solvergraph::GetFieldRefFromLayer<TgridVec>(1);
             attach_block_max.set_edges(storage.merged_patchdata_ghost, storage.refs_block_max);
-            solver_sequence.push_back(
-                std::make_shared<decltype(attach_block_max)>(std::move(attach_block_max)));
+            auto attach_block_max_ptr
+                = std::make_shared<decltype(attach_block_max)>(std::move(attach_block_max));
+            solver_sequence.push_back(attach_block_max_ptr);
+            gz_refresh_nodes.push_back(attach_block_max_ptr);
         }
 
         { // attach spans to gas field with ghosts
             shamrock::solvergraph::GetFieldRefFromLayer<Tscal> attach_rho
                 = shamrock::solvergraph::GetFieldRefFromLayer<Tscal>(storage.ghost_layout, "rho");
             attach_rho.set_edges(storage.merged_patchdata_ghost, storage.refs_rho);
-            solver_sequence.push_back(
-                std::make_shared<decltype(attach_rho)>(std::move(attach_rho)));
+            auto attach_rho_ptr = std::make_shared<decltype(attach_rho)>(std::move(attach_rho));
+            solver_sequence.push_back(attach_rho_ptr);
+            gz_refresh_nodes.push_back(attach_rho_ptr);
 
             shamrock::solvergraph::GetFieldRefFromLayer<Tvec> attach_rhov
                 = shamrock::solvergraph::GetFieldRefFromLayer<Tvec>(storage.ghost_layout, "rhovel");
             attach_rhov.set_edges(storage.merged_patchdata_ghost, storage.refs_rhov);
-            solver_sequence.push_back(
-                std::make_shared<decltype(attach_rhov)>(std::move(attach_rhov)));
+            auto attach_rhov_ptr = std::make_shared<decltype(attach_rhov)>(std::move(attach_rhov));
+            solver_sequence.push_back(attach_rhov_ptr);
+            gz_refresh_nodes.push_back(attach_rhov_ptr);
 
             shamrock::solvergraph::GetFieldRefFromLayer<Tscal> attach_rhoe
                 = shamrock::solvergraph::GetFieldRefFromLayer<Tscal>(
                     storage.ghost_layout, "rhoetot");
             attach_rhoe.set_edges(storage.merged_patchdata_ghost, storage.refs_rhoe);
-            solver_sequence.push_back(
-                std::make_shared<decltype(attach_rhoe)>(std::move(attach_rhoe)));
+            auto attach_rhoe_ptr = std::make_shared<decltype(attach_rhoe)>(std::move(attach_rhoe));
+            solver_sequence.push_back(attach_rhoe_ptr);
+            gz_refresh_nodes.push_back(attach_rhoe_ptr);
         }
 
         if (solver_config.is_dust_on()) { // attach spans to dust field with ghosts
@@ -975,6 +989,9 @@ void shammodels::basegodunov::Solver<Tvec, TgridVec>::init_solver_graph() {
                 std::make_shared<decltype(attach_rhov_dust)>(std::move(attach_rhov_dust)));
         }
     }
+
+    storage.gz_refresh_sequence = std::make_shared<shamrock::solvergraph::OperationSequence>(
+        "Ghost zone refresh before the refinement", std::move(gz_refresh_nodes));
 
     { // build trees
 
@@ -2350,6 +2367,21 @@ void shammodels::basegodunov::Solver<Tvec, TgridVec>::evolve_once() {
     // Solvergraph evaluation
     {
         shambase::get_check_ref(storage.solver_sequence).evaluate();
+    }
+
+    // The ghost zone data (storage.refs_rho, refs_rhov, refs_rhoe) are the state of the beginning
+    // of the step: the step updates the patch data, not their ghost zone copy. Refresh them, so
+    // that the refinement (snapshots giving the slopes of the refined cells, rho_primitive) sees
+    // the end of step state, as RAMSES (make_virtual_fine before flagging and refining). The grid,
+    // the trees and the neighbour graph have not changed since the beginning of the step.
+    if (dt_input > 0 && !solver_config.amr_mode.old_amr) {
+        using AMRmode_None_refresh = typename AMRMode<Tvec, TgridVec>::None;
+        if (std::get_if<AMRmode_None_refresh>(&solver_config.amr_mode.config) == nullptr) {
+            // the ghost layers of the first exchange are still in the exchange edge (freed at the
+            // end of the step), and the extraction appends to it
+            shambase::get_check_ref(storage.exchange_gz_edge).free_alloc();
+            shambase::get_check_ref(storage.gz_refresh_sequence).evaluate();
+        }
     }
 
     if (!solver_config.amr_mode.old_amr) {

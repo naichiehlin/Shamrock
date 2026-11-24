@@ -152,6 +152,9 @@ namespace shammodels::basegodunov {
             cell_graph_edge;
 
         std::shared_ptr<shamrock::solvergraph::OperationSequence> solver_sequence;
+        /// ghost zone exchange and field references with ghosts, evaluated again before the
+        /// refinement
+        std::shared_ptr<shamrock::solvergraph::OperationSequence> gz_refresh_sequence;
 
         std::shared_ptr<shamrock::solvergraph::OperationSequence> node_cons_to_prim;
         std::shared_ptr<modules::NodeBuildTrees<Tmorton, TgridVec>> build_trees;

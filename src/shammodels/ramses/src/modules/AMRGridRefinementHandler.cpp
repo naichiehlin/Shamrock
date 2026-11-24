@@ -1782,6 +1782,21 @@ void shammodels::basegodunov::modules::AMRGridRefinementHandler<Tvec, TgridVec>:
                 }
             }
 
+            // Current (end of step) state of the parent cells, read before any write for the same
+            // reason. The *_old_snap fields (copies of the ghost zone data, refreshed with the end
+            // of step state before the refinement, see Solver::evolve_once) give the slopes, which
+            // need the neighbours in the ghost zones. Before that refresh they held the state of
+            // the beginning of the step, which reverted the refined cells by one step (mass not
+            // conserved, collapse held back at each refinement).
+            std::array<f64, AMRBlock::block_size> parent_rho{};
+            std::array<f64_3, AMRBlock::block_size> parent_rho_vel{};
+            std::array<f64, AMRBlock::block_size> parent_rhoE{};
+            for (u32 loc_id = 0; loc_id < AMRBlock::block_size; loc_id++) {
+                parent_rho[loc_id]     = acc.rho[cur_idx * AMRBlock::block_size + loc_id];
+                parent_rho_vel[loc_id] = acc.rho_vel[cur_idx * AMRBlock::block_size + loc_id];
+                parent_rhoE[loc_id]    = acc.rhoE[cur_idx * AMRBlock::block_size + loc_id];
+            }
+
             for (u32 loc_id = 0; loc_id < AMRBlock::block_size; loc_id++) {
 
                 auto [lx, ly, lz] = get_coord_ref(loc_id);
@@ -1836,11 +1851,11 @@ void shammodels::basegodunov::modules::AMRGridRefinementHandler<Tvec, TgridVec>:
                           + child_center_offsets[subdiv_lid][2] * cons_var_slopes[2];
 
                     _rho_block[subdiv_lid]
-                        = acc.rho_old_snap[old_cell_idx] + cons_var_interp.rho * mul_second_order;
-                    _rho_vel_block[subdiv_lid] = acc.rho_vel_old_snap[old_cell_idx]
-                                                 + cons_var_interp.rhovel * mul_second_order;
+                        = parent_rho[loc_id] + cons_var_interp.rho * mul_second_order;
+                    _rho_vel_block[subdiv_lid]
+                        = parent_rho_vel[loc_id] + cons_var_interp.rhovel * mul_second_order;
                     _rhoE_block[subdiv_lid]
-                        = acc.rhoE_old_snap[old_cell_idx] + cons_var_interp.rhoe * mul_second_order;
+                        = parent_rhoE[loc_id] + cons_var_interp.rhoe * mul_second_order;
 
                     const auto e_int
                         = _rhoE_block[subdiv_lid]
@@ -1858,13 +1873,12 @@ void shammodels::basegodunov::modules::AMRGridRefinementHandler<Tvec, TgridVec>:
 
                     u32 new_cell_idx = get_gid_write(glid);
 
-                    acc.rho[new_cell_idx]     = (do_second_order) ? _rho_block[subdiv_lid]
-                                                                  : acc.rho_old_snap[old_cell_idx];
-                    acc.rho_vel[new_cell_idx] = (do_second_order)
-                                                    ? _rho_vel_block[subdiv_lid]
-                                                    : acc.rho_vel_old_snap[old_cell_idx];
-                    acc.rhoE[new_cell_idx]    = (do_second_order) ? _rhoE_block[subdiv_lid]
-                                                                  : acc.rhoE_old_snap[old_cell_idx];
+                    acc.rho[new_cell_idx]
+                        = (do_second_order) ? _rho_block[subdiv_lid] : parent_rho[loc_id];
+                    acc.rho_vel[new_cell_idx]
+                        = (do_second_order) ? _rho_vel_block[subdiv_lid] : parent_rho_vel[loc_id];
+                    acc.rhoE[new_cell_idx]
+                        = (do_second_order) ? _rhoE_block[subdiv_lid] : parent_rhoE[loc_id];
 
                     if (acc.phi != nullptr) {
                         acc.phi[new_cell_idx]     = parent_phi[loc_id];
